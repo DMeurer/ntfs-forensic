@@ -398,7 +398,11 @@ impl<R: Read + Seek> NtfsFs<R> {
     /// `$ATTRIBUTE_LIST` (if any) — so a fragmented file's attributes can be
     /// found wherever the MFT spread them. Cycles are broken by tracking seen
     /// record numbers.
-    fn gather_records(&self, base_num: u64, base_record: &[u8]) -> Result<Vec<Vec<u8>>> {
+    ///
+    /// # Errors
+    ///
+    /// Record and `$ATTRIBUTE_LIST` errors.
+    pub fn gather_records(&self, base_num: u64, base_record: &[u8]) -> Result<Vec<Vec<u8>>> {
         let base_attrs = record_attributes(base_record)?;
         let mut records = vec![base_record.to_vec()];
 
