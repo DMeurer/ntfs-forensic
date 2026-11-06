@@ -1400,6 +1400,54 @@ mod tests {
             .any(|e| e.file_name.as_ref().map(|f| f.name.as_str()) == Some("deep.bin")));
     }
 
+    /// A large directory whose `$INDEX_ALLOCATION` lives in an extension record,
+    /// named by the base record's `$ATTRIBUTE_LIST` — what Windows does once a
+    /// big folder's attributes outgrow one FILE record (`system32` on a real XP
+    /// image). Volume: MFT (records 0–6) at LCN 4, INDX buffer at LCN 18.
+    fn build_volume_index_in_extension_record() -> Cursor<Vec<u8>> {
+        let mft_clusters = 14u64; // 7 records × 1024 / 512
+        let indx_lcn = MFT_LCN + mft_clusters; // 18
+        let total_clusters = indx_lcn + 2;
+        let mut vol = vec![0u8; total_clusters as usize * CLUSTER];
+        vol[0..512].copy_from_slice(&build_boot());
+
+        let runs = [0x11u8, mft_clusters as u8, MFT_LCN as u8, 0x00];
+        let rec0 = build_record(
+            0x0001,
+            &nonresident_data(&runs, mft_clusters * CLUSTER as u64),
+        );
+
+        // record 5: large root; its $INDEX_ALLOCATION is in extension record 6.
+        let attrlist = [
+            attrlist_entry(attr_types::INDEX_ROOT, 5, 0),
+            attrlist_entry(attr_types::INDEX_ALLOCATION, 6, 0),
+        ]
+        .concat();
+        let mut root_attrs = index_root_large(&[index_end()]);
+        root_attrs.extend_from_slice(&attr_resident(attr_types::ATTRIBUTE_LIST, None, &attrlist));
+        let rec5 = build_record(0x0003, &root_attrs);
+        let alloc_runs = [0x11u8, 0x01, indx_lcn as u8, 0x00];
+        let rec6 = build_record(0x0001, &index_allocation(&alloc_runs, CLUSTER as u64));
+
+        let mft_off = MFT_LCN as usize * CLUSTER;
+        vol[mft_off..mft_off + rec0.len()].copy_from_slice(&rec0);
+        let r5 = mft_off + 5 * REC;
+        vol[r5..r5 + rec5.len()].copy_from_slice(&rec5);
+        let r6 = mft_off + 6 * REC;
+        vol[r6..r6 + rec6.len()].copy_from_slice(&rec6);
+
+        let indx = build_indx(9, "deep.bin");
+        let io = indx_lcn as usize * CLUSTER;
+        vol[io..io + indx.len()].copy_from_slice(&indx);
+        Cursor::new(vol)
+    }
+
+    #[test]
+    fn resolves_a_child_whose_index_allocation_is_in_an_extension_record() {
+        let fs = NtfsFs::open(build_volume_index_in_extension_record()).unwrap();
+        assert_eq!(fs.resolve_path("deep.bin").unwrap(), 9);
+    }
+
     #[test]
     fn directory_without_index_root_is_not_a_directory() {
         let rec = build_record(0x0001, &resident_data(b"x"));
