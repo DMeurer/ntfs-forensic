@@ -109,16 +109,52 @@ impl<R: Read + Seek> NtfsFs<R> {
     /// [`NtfsError::NotADirectory`] if the record has no `$INDEX_ROOT`, plus
     /// index errors.
     pub fn directory_entries(&self, record: &[u8]) -> Result<Vec<IndexEntry>> {
-        let attrs = record_attributes(record)?;
+        self.index_entries(std::slice::from_ref(&record.to_vec()))
+    }
 
-        let root_attr = attrs
-            .iter()
-            .find(|a| a.type_code == attr_types::INDEX_ROOT)
-            .ok_or_else(|| NtfsError::NotADirectory("record has no $INDEX_ROOT".to_string()))?;
-        let root_content = root_attr
-            .resident_content(record)
-            .ok_or(NtfsError::BadIndex("$INDEX_ROOT content out of bounds"))?;
-        let root = IndexRoot::parse(root_content)?;
+    /// List the child entries of directory record `rec_num`, following its
+    /// `$ATTRIBUTE_LIST`: in a large directory the `$INDEX_ALLOCATION` can live
+    /// in an extension record, or be split into fragments across several, and
+    /// [`directory_entries`](Self::directory_entries) on the base record alone
+    /// then misses most of the children.
+    ///
+    /// # Errors
+    ///
+    /// [`NtfsError::NotADirectory`] if no record has an `$INDEX_ROOT`, plus
+    /// record, runlist and index errors.
+    pub fn directory_entries_by_record(&self, rec_num: u64) -> Result<Vec<IndexEntry>> {
+        let record = self.read_record(rec_num)?;
+        let records = self.gather_records(rec_num, &record)?;
+        self.index_entries(&records)
+    }
+
+    /// The child entries of the index whose attributes are spread over
+    /// `records` (the base record first).
+    fn index_entries(&self, records: &[Vec<u8>]) -> Result<Vec<IndexEntry>> {
+        let mut root = None;
+        // (start_vcn, real_size, record index, attribute) per $INDEX_ALLOCATION fragment.
+        let mut fragments: Vec<(u64, u64, usize, Attribute)> = Vec::new();
+        for (idx, rec) in records.iter().enumerate() {
+            for attr in record_attributes(rec)? {
+                if attr.type_code == attr_types::INDEX_ROOT && root.is_none() {
+                    let content = attr
+                        .resident_content(rec)
+                        .ok_or(NtfsError::BadIndex("$INDEX_ROOT content out of bounds"))?;
+                    root = Some(IndexRoot::parse(content)?);
+                } else if attr.type_code == attr_types::INDEX_ALLOCATION {
+                    if let AttributeBody::NonResident {
+                        start_vcn,
+                        real_size,
+                        ..
+                    } = attr.body
+                    {
+                        fragments.push((start_vcn, real_size, idx, attr));
+                    }
+                }
+            }
+        }
+        let root =
+            root.ok_or_else(|| NtfsError::NotADirectory("record has no $INDEX_ROOT".to_string()))?;
 
         let mut out: Vec<IndexEntry> = root
             .entries
@@ -126,26 +162,29 @@ impl<R: Read + Seek> NtfsFs<R> {
             .filter(|e| e.file_name.is_some())
             .collect();
 
-        if root.is_large {
-            if let Some(alloc) = attrs
-                .iter()
-                .find(|a| a.type_code == attr_types::INDEX_ALLOCATION)
-            {
-                let data = {
-                    let mut reader = self.lock_reader();
-                    read_attribute_value(&mut *reader, record, alloc, self.boot.cluster_size())?
-                };
-                let irs = self.boot.index_record_size as usize;
-                let mut off = 0;
-                while off + irs <= data.len() {
-                    if &data[off..off + 4] == b"INDX" {
-                        let mut buf = data[off..off + irs].to_vec();
-                        let entries =
-                            parse_index_buffer(&mut buf, irs, self.boot.bytes_per_sector as usize)?;
-                        out.extend(entries.into_iter().filter(|e| e.file_name.is_some()));
-                    }
-                    off += irs;
+        if root.is_large && !fragments.is_empty() {
+            // Concatenate the fragments' runlists in VCN order; the total size is
+            // carried by the first fragment (start VCN 0).
+            fragments.sort_by_key(|(start_vcn, _, _, _)| *start_vcn);
+            let real_size = fragments[0].1;
+            let mut runs = Vec::new();
+            for (_, _, idx, attr) in &fragments {
+                runs.extend(crate::data::attribute_runlist(&records[*idx], attr)?);
+            }
+            let data = {
+                let mut reader = self.lock_reader();
+                crate::data::read_runs(&mut *reader, &runs, self.boot.cluster_size(), real_size)?
+            };
+            let irs = self.boot.index_record_size as usize;
+            let mut off = 0;
+            while off + irs <= data.len() {
+                if &data[off..off + 4] == b"INDX" {
+                    let mut buf = data[off..off + irs].to_vec();
+                    let entries =
+                        parse_index_buffer(&mut buf, irs, self.boot.bytes_per_sector as usize)?;
+                    out.extend(entries.into_iter().filter(|e| e.file_name.is_some()));
                 }
+                off += irs;
             }
         }
 
@@ -160,8 +199,7 @@ impl<R: Read + Seek> NtfsFs<R> {
     pub fn resolve_path(&self, path: &str) -> Result<u64> {
         let mut current = mft_records::ROOT;
         for component in path.split(['\\', '/']).filter(|c| !c.is_empty()) {
-            let record = self.read_record(current)?;
-            let entries = self.directory_entries(&record)?;
+            let entries = self.directory_entries_by_record(current)?;
             current = entries
                 .iter()
                 .find_map(|e| {
