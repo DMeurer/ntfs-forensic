@@ -13,3 +13,21 @@ fn usn_parser_core_is_exposed_and_rejects_short_input() {
     let _ = (FileAttributes::empty(), UsnReason::empty());
     fn _accepts_record(_: &UsnRecord) {}
 }
+
+/// A long run of bytes that are no record (no zeros, no valid length) is skipped 8 bytes at a
+/// time. That has to be a loop: on a small stack, skipping by recursion overflows it.
+#[test]
+fn reader_skips_a_long_run_of_junk_without_recursing() {
+    let junk = vec![0xFFu8; 4 * 1024 * 1024];
+    let skipped = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            ntfs_core::UsnJournalReader::new(std::io::Cursor::new(junk))
+                .unwrap()
+                .count()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(skipped, 0);
+}
