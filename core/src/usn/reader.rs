@@ -104,72 +104,73 @@ impl<R: Read + Seek> Iterator for UsnJournalReader<R> {
     type Item = Result<UsnRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
+        // A loop, not recursion: a long run of junk would overflow the stack.
+        loop {
+            if self.done {
+                return None;
+            }
 
-        // Ensure we have data
-        if self.buf_offset >= self.buf_len {
-            match self.fill_buffer() {
+            // Ensure we have data
+            if self.buf_offset >= self.buf_len {
+                match self.fill_buffer() {
+                    Ok(true) => {}
+                    Ok(false) => return None,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+
+            // Skip zero-filled regions
+            match self.skip_zeros() {
                 Ok(true) => {}
                 Ok(false) => return None,
                 Err(e) => return Some(Err(e)),
             }
-        }
 
-        // Skip zero-filled regions
-        match self.skip_zeros() {
-            Ok(true) => {}
-            Ok(false) => return None,
-            Err(e) => return Some(Err(e)),
-        }
-
-        // Need at least 8 bytes for record length + version
-        if self.buf_offset + 8 > self.buf_len {
-            match self.fill_buffer() /* cov:unreachable: skip_zeros returns Ok(true) only from its inner arm where buf_offset + 8 <= buf_len holds, so this header-refill block is never entered */ {
-                Ok(true) if self.buf_offset + 8 <= self.buf_len => {} // cov:unreachable: see above — the enclosing if is never entered
-                _ => return None, // cov:unreachable: see above — the enclosing if is never entered
-            }
-        }
-
-        let record_len = le_u32(&self.buf, self.buf_offset) as usize;
-
-        if !(8..=65536).contains(&record_len) {
-            self.buf_offset += 8;
-            return self.next();
-        }
-
-        // Ensure we have the full record in buffer
-        if self.buf_offset + record_len > self.buf_len {
-            match self.fill_buffer() {
-                Ok(true) if self.buf_offset + record_len <= self.buf_len => {}
-                _ => {
-                    self.buf_offset += 8;
-                    return self.next();
+            // Need at least 8 bytes for record length + version
+            if self.buf_offset + 8 > self.buf_len {
+                match self.fill_buffer() /* cov:unreachable: skip_zeros returns Ok(true) only from its inner arm where buf_offset + 8 <= buf_len holds, so this header-refill block is never entered */ {
+                    Ok(true) if self.buf_offset + 8 <= self.buf_len => {} // cov:unreachable: see above — the enclosing if is never entered
+                    _ => return None, // cov:unreachable: see above — the enclosing if is never entered
                 }
             }
-        }
 
-        let version = le_u16(&self.buf, self.buf_offset + 4);
+            let record_len = le_u32(&self.buf, self.buf_offset) as usize;
 
-        let Some(record_data) = self.buf.get(self.buf_offset..self.buf_offset + record_len) else {
-            self.buf_offset += 8; // cov:unreachable: the buf_offset + record_len <= buf_len (<= BUF_SIZE == buf.len()) check above dominates, so this get is always Some
-            return self.next(); // cov:unreachable: see above — the None branch is never taken
-        };
-        let record_data = record_data.to_vec();
-        let aligned = (record_len + 7) & !7;
-        self.buf_offset += aligned;
+            if !(8..=65536).contains(&record_len) {
+                self.buf_offset += 8;
+                continue;
+            }
 
-        match version {
-            2 => match parse_usn_record_v2(&record_data) {
-                Ok(r) => Some(Ok(r)),
-                Err(_) => self.next(),
-            },
-            3 => match parse_usn_record_v3(&record_data) {
-                Ok(r) => Some(Ok(r)),
-                Err(_) => self.next(),
-            },
-            _ => self.next(),
+            // Ensure we have the full record in buffer
+            if self.buf_offset + record_len > self.buf_len {
+                match self.fill_buffer() {
+                    Ok(true) if self.buf_offset + record_len <= self.buf_len => {}
+                    _ => {
+                        self.buf_offset += 8;
+                        continue;
+                    }
+                }
+            }
+
+            let version = le_u16(&self.buf, self.buf_offset + 4);
+
+            let Some(record_data) = self.buf.get(self.buf_offset..self.buf_offset + record_len)
+            else {
+                self.buf_offset += 8; // cov:unreachable: the buf_offset + record_len <= buf_len (<= BUF_SIZE == buf.len()) check above dominates, so this get is always Some
+                continue; // cov:unreachable: see above — the None branch is never taken
+            };
+            let record_data = record_data.to_vec();
+            let aligned = (record_len + 7) & !7;
+            self.buf_offset += aligned;
+
+            let parsed = match version {
+                2 => parse_usn_record_v2(&record_data).ok(),
+                3 => parse_usn_record_v3(&record_data).ok(),
+                _ => None,
+            };
+            if let Some(r) = parsed {
+                return Some(Ok(r));
+            }
         }
     }
 }
