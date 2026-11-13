@@ -177,6 +177,15 @@ pub(crate) fn read_nonresident_capped<R: Read + Seek>(
                 offset: attribute.offset,
                 detail: "implausible compression unit",
             })?;
+        let AttributeBody::NonResident {
+            initialized_size, ..
+        } = attribute.body
+        else {
+            return Err(NtfsError::BadAttribute {
+                offset: attribute.offset,
+                detail: "attribute is resident (no runlist)",
+            });
+        };
         read_compressed_runs_capped(
             reader,
             runs,
@@ -184,6 +193,7 @@ pub(crate) fn read_nonresident_capped<R: Read + Seek>(
             real_size,
             unit_clusters,
             max_bytes,
+            initialized_size,
         )
     } else {
         read_runs_capped(reader, runs, cluster_size, real_size, max_bytes)
@@ -211,6 +221,7 @@ fn read_compressed_runs_capped<R: Read + Seek>(
     real_size: u64,
     unit_clusters: u64,
     max_bytes: u64,
+    initialized: u64,
 ) -> Result<Vec<u8>> {
     if real_size > MAX_VALUE_BYTES {
         return Err(NtfsError::TooLarge { bytes: real_size });
@@ -280,8 +291,14 @@ fn read_compressed_runs_capped<R: Read + Seek>(
             // slack the decoder ran into can't misalign later units (the final
             // unit is bounded by the truncate to real_size below).
             let mut decompressed = Vec::new();
-            lznt1::decompress(&real_bytes, &mut decompressed)
-                .map_err(|_| NtfsError::BadCompression("LZNT1 decode failed"))?;
+            if lznt1::decompress(&real_bytes, &mut decompressed).is_err() {
+                // Windows never wrote a unit past the initialized size: its
+                // clusters hold stale bytes that need not be LZNT1 → zeroes.
+                if (out.len() as u64) < initialized {
+                    return Err(NtfsError::BadCompression("LZNT1 decode failed"));
+                }
+                decompressed = vec![0; unit_bytes as usize];
+            }
             decompressed.truncate(unit_bytes as usize);
             out.extend_from_slice(&decompressed);
         }
@@ -593,7 +610,8 @@ mod tests {
             length: 16,
             lcn: None,
         }];
-        let out = read_compressed_runs_capped(&mut vol, &runs, 512, 100, 16, u64::MAX).unwrap();
+        let out =
+            read_compressed_runs_capped(&mut vol, &runs, 512, 100, 16, u64::MAX, u64::MAX).unwrap();
         assert_eq!(out, vec![0u8; 100]);
     }
 
@@ -607,7 +625,8 @@ mod tests {
             lcn: Some(0),
         }];
         let out =
-            read_compressed_runs_capped(&mut vol, &runs, 512, 16 * 512, 16, u64::MAX).unwrap();
+            read_compressed_runs_capped(&mut vol, &runs, 512, 16 * 512, 16, u64::MAX, u64::MAX)
+                .unwrap();
         assert_eq!(out.len(), 16 * 512);
         assert!(out.iter().all(|&b| b == 0x5A));
     }
@@ -623,7 +642,8 @@ mod tests {
             lcn: Some(0),
         }];
         let out =
-            read_compressed_runs_capped(&mut vol, &runs, 512, 2 * 16 * 512, 16, u64::MAX).unwrap();
+            read_compressed_runs_capped(&mut vol, &runs, 512, 2 * 16 * 512, 16, u64::MAX, u64::MAX)
+                .unwrap();
         assert_eq!(out.len(), 16 * 512, "only the available unit is returned");
     }
 
@@ -634,8 +654,15 @@ mod tests {
             length: 1,
             lcn: Some(0),
         }];
-        let err =
-            read_compressed_runs_capped(&mut vol, &runs, 512, MAX_VALUE_BYTES + 1, 16, u64::MAX);
+        let err = read_compressed_runs_capped(
+            &mut vol,
+            &runs,
+            512,
+            MAX_VALUE_BYTES + 1,
+            16,
+            u64::MAX,
+            u64::MAX,
+        );
         assert!(matches!(err, Err(NtfsError::TooLarge { .. })));
     }
 
@@ -648,12 +675,21 @@ mod tests {
             lcn: Some(0),
         }];
         let mut full_vol = std::io::Cursor::new(vec![0x5Au8; 16 * 512]);
-        let full =
-            read_compressed_runs_capped(&mut full_vol, &runs, 512, 16 * 512, 16, u64::MAX).unwrap();
+        let full = read_compressed_runs_capped(
+            &mut full_vol,
+            &runs,
+            512,
+            16 * 512,
+            16,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
 
         let cap = 700u64;
         let mut vol = std::io::Cursor::new(vec![0x5Au8; 16 * 512]);
-        let out = read_compressed_runs_capped(&mut vol, &runs, 512, 16 * 512, 16, cap).unwrap();
+        let out =
+            read_compressed_runs_capped(&mut vol, &runs, 512, 16 * 512, 16, cap, u64::MAX).unwrap();
         assert!(out.len() as u64 <= cap);
         assert_eq!(out.len(), cap as usize);
         assert_eq!(
