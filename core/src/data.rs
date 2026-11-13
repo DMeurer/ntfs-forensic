@@ -541,6 +541,51 @@ mod tests {
     }
 
     #[test]
+    fn compressed_unit_past_initialized_size_that_fails_to_decode_is_zeroes() {
+        use forensicnomicon::ntfs::attr_types;
+        // One compression unit (1 real cluster + 15 sparse) whose real cluster
+        // holds stale bytes, not LZNT1: 0x5A5A claims a 2652-byte raw chunk in
+        // a 512-byte cluster. Windows never wrote a unit past the initialized
+        // size, so there it reads as zeroes; before it, it is still an error.
+        let record_with = |initialized: u64| {
+            let runs_bytes = [0x11u8, 0x01, 0x02, 0x01, 0x0F, 0x00];
+            let attr_off = 0x10usize;
+            let mut record = vec![0u8; attr_off];
+            let runs_offset = 0x40u16;
+            let length = ((runs_offset as usize + runs_bytes.len()) + 7) & !7;
+            let mut a = vec![0u8; length];
+            a[0x00..0x04].copy_from_slice(&attr_types::DATA.to_le_bytes());
+            a[0x04..0x08].copy_from_slice(&(length as u32).to_le_bytes());
+            a[0x08] = 1; // non-resident
+            a[0x0A..0x0C].copy_from_slice(&runs_offset.to_le_bytes()); // name offset (no name)
+            a[0x0C..0x0E].copy_from_slice(&0x0001u16.to_le_bytes()); // flags: COMPRESSED
+            a[0x20..0x22].copy_from_slice(&runs_offset.to_le_bytes()); // runs offset
+            a[0x22..0x24].copy_from_slice(&4u16.to_le_bytes()); // compression_unit = 4 → 16 clusters
+            a[0x28..0x30].copy_from_slice(&(16u64 * 512).to_le_bytes()); // allocated 8192
+            a[0x30..0x38].copy_from_slice(&100u64.to_le_bytes()); // real size 100
+            a[0x38..0x40].copy_from_slice(&initialized.to_le_bytes()); // initialized size
+            a[runs_offset as usize..runs_offset as usize + runs_bytes.len()]
+                .copy_from_slice(&runs_bytes);
+            record.extend_from_slice(&a);
+            record.extend_from_slice(&attr_types::END.to_le_bytes());
+            record
+        };
+        let mut disk = vec![0u8; 16 * 512];
+        disk[2 * 512..3 * 512].fill(0x5A);
+        let mut vol = std::io::Cursor::new(disk);
+
+        let stale = record_with(0);
+        let attrs = crate::attribute::parse_attributes(&stale, 0x10).unwrap();
+        let out = read_attribute_value(&mut vol, &stale, &attrs[0], 512).unwrap();
+        assert_eq!(out, vec![0u8; 100]);
+
+        let written = record_with(100);
+        let attrs = crate::attribute::parse_attributes(&written, 0x10).unwrap();
+        let err = read_attribute_value(&mut vol, &written, &attrs[0], 512);
+        assert!(matches!(err, Err(NtfsError::BadCompression(_))));
+    }
+
+    #[test]
     fn compressed_runs_fully_sparse_unit_is_zeroes() {
         // A unit with no allocated clusters (real_clusters == 0) is a hole → zeroes.
         let mut vol = std::io::Cursor::new(vec![0u8; 16 * 512]);
